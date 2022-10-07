@@ -2,7 +2,37 @@
 name = "spigot-build-tools"
 version = "0.0.1"
 edition = "2021"
+authors = ["Jacobtread"]
+description = "A version of the spigot build tools re-written in Rust as a library"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+reqwest = { version = "0.11.12", features = ["json"] }
+tokio = { version = "1.21.1", features = ["full"] }
+futures = "0.3.24"
+
+# Environment & Logging
+log = "0.4.17"
+env_logger = "0.9.1"
+dotenv = "0.15.0"
+
+# Parsing and Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.6.0"
+async_zip = { git = "https://github.com/Majored/rs-async-zip.git" }
+
+# Hash Checking
+sha1_smol = "1.0.0"
+md5 = "0.7.0"
+sha256 = "1.0.3"
+
+# Misc
+git2 = "0.15.0"
+lazy_static = "1.4.0"
+hashcow = "0.2.0"
+patch = "0.6.0"
+async-walkdir = "0.2.0"
+derive_more = "0.99.17"
