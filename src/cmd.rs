@@ -1,13 +1,17 @@
 use std::env::current_dir;
 use std::ffi::c_int;
+use std::future::{Future, poll_fn};
+use std::io::BufRead;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::ExitStatus;
+use std::task::{Context, Poll};
 use derive_more::From;
 use derive_more::Display;
 use log::{error, info, warn};
 use tokio::process::Command;
-use tokio::io::{AsyncReadExt, self, BufReader, AsyncBufReadExt};
-use tokio::select;
+use tokio::io::{AsyncReadExt, self, BufReader, AsyncBufReadExt, Lines, AsyncRead};
+use tokio::{select, try_join};
 
 #[derive(Debug, From, Display)]
 pub enum CommandError {
@@ -15,10 +19,6 @@ pub enum CommandError {
     IO(io::Error),
     #[display(fmt = "Provided command string didn't contain a command. (Was it empty?)")]
     MissingCommand,
-    #[display(fmt = "Unable to get Stdout for child process")]
-    NoStdout,
-    #[display(fmt = "Unable to get Stderr for child process")]
-    NoStderr,
     #[display(fmt = "Process exited with non-zero exit code: Code {}", _0)]
     NoZeroExitCode(i32)
 }
@@ -55,13 +55,43 @@ pub async fn run_command_format(
     }
 
     let exit_status = pipe_and_wait(command).await?;
-    if exit_status.success() {
-        let code = exit_status.code()
-            .unwrap_or(-1);
-        return Err(CommandError::NoZeroExitCode(code))
+    let code = exit_status.code()
+            .unwrap_or(0);
+    if code != 0  {
+        return Err(CommandError::NoZeroExitCode(code));
     }
 
+
     Ok(())
+}
+
+struct OptionalReader<V> {
+    child: Option<Lines<BufReader<V>>>,
+}
+
+impl<V> OptionalReader<V> where V: Unpin + AsyncRead {
+    fn new(value: Option<V>) -> Self {
+        Self {
+            child: value
+                .map(|value| BufReader::new(value).lines())
+        }
+    }
+
+    async fn next_line(&mut self) -> io::Result<Option<String>> {
+        if let Some(child) = &mut self.child {
+            return child.next_line().await;
+        }
+        // Never resolve if no child
+        return poll_fn(|_| Poll::Pending).await
+    }
+}
+
+impl<V> Future for OptionalReader<V> where V: AsyncRead {
+    type Output = io::Result<Option<String>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
 }
 
 /// Spawns the command child piping its output to the error logging for
@@ -70,13 +100,9 @@ pub async fn run_command_format(
 async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
     let mut child = command.spawn()?;
 
-    let stdout = child.stdout.take()
-        .ok_or(CommandError::NoStdout)?;
-    let stderr = child.stderr.take()
-        .ok_or(CommandError::NoStderr)?;
+    let mut stdout =  OptionalReader::new(child.stdout.take());
+    let mut stderr =  OptionalReader::new(child.stderr.take());
 
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
 
     /// Splits a piped line output into the line itself and a
     /// logging level if one is present
@@ -110,7 +136,7 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
             return;
         }
 
-        /// Java exceptions
+        // Java exceptions
         if line.starts_with("Exception in thread") {
             error!("{line}");
             *errored = true;
@@ -125,13 +151,13 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
 
     loop {
         select! {
-            result = stdout_reader.next_line() => {
+            result = stdout.next_line() => {
                 let result = result?;
                 if let Some(line) = result {
                     pipe_line(&line, false, &mut errored);
                 }
             }
-            result = stderr_reader.next_line() => {
+            result = stderr.next_line() => {
                 let result = result?;
                 if let Some(line) = result {
                     pipe_line(&line, true, &mut errored);
@@ -139,7 +165,7 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
             }
             result = child.wait() => {
                 let result = result?;
-                return result;
+                return Ok(result);
             }
         }
     }
@@ -194,7 +220,7 @@ mod test {
     async fn test_ls() -> CommandResult<()> {
         let working_dir = current_dir()?;
 
-        let command = "ls {0}";
+        let command = "bash ./test/test.sh {0}";
         let args = ["target"];
 
         run_command_format(&working_dir, command, &args).await
