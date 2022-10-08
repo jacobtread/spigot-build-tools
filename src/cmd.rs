@@ -1,17 +1,13 @@
-use std::env::current_dir;
-use std::ffi::c_int;
-use std::future::{Future, poll_fn};
-use std::io::BufRead;
+use std::future::poll_fn;
 use std::path::Path;
-use std::pin::Pin;
-use std::process::ExitStatus;
-use std::task::{Context, Poll};
+use std::process::{ExitStatus, Stdio};
+use std::task::Poll;
 use derive_more::From;
 use derive_more::Display;
 use log::{error, info, warn};
 use tokio::process::Command;
-use tokio::io::{AsyncReadExt, self, BufReader, AsyncBufReadExt, Lines, AsyncRead};
-use tokio::{select, try_join};
+use tokio::io::{self, BufReader, AsyncBufReadExt, Lines, AsyncRead};
+use tokio::select;
 
 #[derive(Debug, From, Display)]
 pub enum CommandError {
@@ -41,6 +37,8 @@ pub async fn run_command_format(
     let mut command = Command::new(cmd);
     command.args(&args);
     command.current_dir(working_dir);
+    command.stderr(Stdio::piped());
+    command.stdout(Stdio::piped());
 
     // Java specific environment variables
     const JAVA_ENV: &str = "_JAVA_OPTIONS";
@@ -61,15 +59,21 @@ pub async fn run_command_format(
         return Err(CommandError::NoZeroExitCode(code));
     }
 
-
     Ok(())
 }
 
+/// Custom buf reader structure for reading from a buffered
+/// reader in a select statement where the underlying reader
+/// could possibly be None (In case of stderr / stdout) this
+/// should be used in a select macro
+#[derive(Debug)]
 struct OptionalReader<V> {
     child: Option<Lines<BufReader<V>>>,
 }
 
 impl<V> OptionalReader<V> where V: Unpin + AsyncRead {
+
+    /// Constructor for creating a new reader
     fn new(value: Option<V>) -> Self {
         Self {
             child: value
@@ -77,20 +81,14 @@ impl<V> OptionalReader<V> where V: Unpin + AsyncRead {
         }
     }
 
+    /// Async function for reading the next line. If the underlying
+    /// reader is None this will just await infinitely
     async fn next_line(&mut self) -> io::Result<Option<String>> {
         if let Some(child) = &mut self.child {
             return child.next_line().await;
         }
         // Never resolve if no child
         return poll_fn(|_| Poll::Pending).await
-    }
-}
-
-impl<V> Future for OptionalReader<V> where V: AsyncRead {
-    type Output = io::Result<Option<String>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Pending
     }
 }
 
@@ -102,7 +100,6 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
 
     let mut stdout =  OptionalReader::new(child.stdout.take());
     let mut stderr =  OptionalReader::new(child.stderr.take());
-
 
     /// Splits a piped line output into the line itself and a
     /// logging level if one is present
@@ -213,17 +210,52 @@ fn transform_args<'a: 'b, 'b>(args: Vec<&'a str>, args_in: &'a [&str]) -> Vec<&'
 #[cfg(test)]
 mod test {
     use std::env::current_dir;
-    use std::io;
-    use crate::cmd::{CommandResult, run_command_format};
+    use env_logger::WriteStyle;
+    use log::LevelFilter;
+    use crate::cmd::{CommandError, CommandResult, run_command_format};
+
+    fn init_logger() {
+        env_logger::builder()
+            .write_style(WriteStyle::Always)
+            .filter_level(LevelFilter::Info)
+            .try_init()
+            .ok();
+    }
 
     #[tokio::test]
-    async fn test_ls() -> CommandResult<()> {
+    async fn test() -> CommandResult<()> {
+        init_logger();
+
         let working_dir = current_dir()?;
 
         let command = "bash ./test/test.sh {0}";
         let args = ["target"];
 
         run_command_format(&working_dir, command, &args).await
+    }
+
+    #[tokio::test]
+    async fn test_err() -> CommandResult<()> {
+        init_logger();
+
+        let working_dir = current_dir()?;
+
+        let command = "bash ./test/test_err.sh {0}";
+        let args = ["target"];
+        let error_code = 5;
+
+
+       let err = run_command_format(&working_dir, command, &args).await
+            .unwrap_err();
+
+        match err {
+            CommandError::NoZeroExitCode(code) => {
+                assert_eq!(code, error_code)
+            }
+            err => return Err(err),
+        }
+
+        Ok(())
     }
 
 }
