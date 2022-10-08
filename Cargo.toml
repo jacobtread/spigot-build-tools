@@ -30,9 +30,7 @@ md5 = "0.7.0"
 sha256 = "1.0.3"
 
 # Misc
-git2 = "0.15.0"
 lazy_static = "1.4.0"
 hashcow = "0.2.0"
-patch = "0.6.0"
 async-walkdir = "0.2.0"
 derive_more = "0.99.17"

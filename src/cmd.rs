@@ -1,12 +1,12 @@
+use derive_more::Display;
+use derive_more::From;
+use log::{error, info, warn};
 use std::future::poll_fn;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::task::Poll;
-use derive_more::From;
-use derive_more::Display;
-use log::{error, info, warn};
+use tokio::io::{self, AsyncBufReadExt, AsyncRead, BufReader, Lines};
 use tokio::process::Command;
-use tokio::io::{self, BufReader, AsyncBufReadExt, Lines, AsyncRead};
 use tokio::select;
 
 #[derive(Debug, From, Display)]
@@ -16,10 +16,32 @@ pub enum CommandError {
     #[display(fmt = "Provided command string didn't contain a command. (Was it empty?)")]
     MissingCommand,
     #[display(fmt = "Process exited with non-zero exit code: Code {}", _0)]
-    NoZeroExitCode(i32)
+    NoZeroExitCode(i32),
 }
 
 type CommandResult<T> = Result<T, CommandError>;
+
+/// Executes the provided command with the arguments provided
+pub async fn run_command(
+    working_dir: impl AsRef<Path>,
+    command: &str,
+    args: &[&str],
+) -> CommandResult<()> {
+    let mut command = Command::new(command);
+    command.args(args);
+    command.current_dir(working_dir);
+    command.stderr(Stdio::piped());
+    command.stdout(Stdio::piped());
+    apply_env(&mut command);
+
+    let exit_status = pipe_and_wait(command).await?;
+    let code = exit_status.code().unwrap_or(0);
+    if code != 0 {
+        return Err(CommandError::NoZeroExitCode(code));
+    }
+
+    Ok(())
+}
 
 /// Executes the provided command in the provided working directory
 /// in this case the command is a format string which can contain
@@ -30,8 +52,7 @@ pub async fn run_command_format(
     command: &str,
     args_in: &[&str],
 ) -> CommandResult<()> {
-    let (cmd, args) = split_command(command)
-        .ok_or(CommandError::MissingCommand)?;
+    let (cmd, args) = split_command(command).ok_or(CommandError::MissingCommand)?;
     let args = transform_args(args, args_in);
 
     let mut command = Command::new(cmd);
@@ -39,11 +60,27 @@ pub async fn run_command_format(
     command.current_dir(working_dir);
     command.stderr(Stdio::piped());
     command.stdout(Stdio::piped());
+    apply_env(&mut command);
 
+    let exit_status = pipe_and_wait(command).await?;
+    let code = exit_status.code().unwrap_or(0);
+    if code != 0 {
+        return Err(CommandError::NoZeroExitCode(code));
+    }
+
+    Ok(())
+}
+
+/// Applies the build tools specific command environment variables
+/// if they aren't already added as system variables
+fn apply_env(command: &mut Command) {
     // Java specific environment variables
     const JAVA_ENV: &str = "_JAVA_OPTIONS";
     if std::env::var(JAVA_ENV).is_err() {
-        command.env(JAVA_ENV, "-Djdk.net.URLClassPath.disableClassPathURLCheck=true");
+        command.env(
+            JAVA_ENV,
+            "-Djdk.net.URLClassPath.disableClassPathURLCheck=true",
+        );
     }
 
     // Maven specific environment variables
@@ -51,15 +88,6 @@ pub async fn run_command_format(
     if std::env::var(MAVEN_ENV).is_err() {
         command.env(MAVEN_ENV, "-Xmx1024M");
     }
-
-    let exit_status = pipe_and_wait(command).await?;
-    let code = exit_status.code()
-            .unwrap_or(0);
-    if code != 0  {
-        return Err(CommandError::NoZeroExitCode(code));
-    }
-
-    Ok(())
 }
 
 /// Custom buf reader structure for reading from a buffered
@@ -71,13 +99,14 @@ struct OptionalReader<V> {
     child: Option<Lines<BufReader<V>>>,
 }
 
-impl<V> OptionalReader<V> where V: Unpin + AsyncRead {
-
+impl<V> OptionalReader<V>
+where
+    V: Unpin + AsyncRead,
+{
     /// Constructor for creating a new reader
     fn new(value: Option<V>) -> Self {
         Self {
-            child: value
-                .map(|value| BufReader::new(value).lines())
+            child: value.map(|value| BufReader::new(value).lines()),
         }
     }
 
@@ -88,7 +117,7 @@ impl<V> OptionalReader<V> where V: Unpin + AsyncRead {
             return child.next_line().await;
         }
         // Never resolve if no child
-        return poll_fn(|_| Poll::Pending).await
+        return poll_fn(|_| Poll::Pending).await;
     }
 }
 
@@ -98,8 +127,8 @@ impl<V> OptionalReader<V> where V: Unpin + AsyncRead {
 async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
     let mut child = command.spawn()?;
 
-    let mut stdout =  OptionalReader::new(child.stdout.take());
-    let mut stderr =  OptionalReader::new(child.stderr.take());
+    let mut stdout = OptionalReader::new(child.stdout.take());
+    let mut stderr = OptionalReader::new(child.stderr.take());
 
     /// Splits a piped line output into the line itself and a
     /// logging level if one is present
@@ -111,24 +140,18 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
         }
         let level = &line[start + 1..end - 1];
         let text = &line[end + 1..];
-        Some((level ,text))
+        Some((level, text))
     }
 
     /// Pipes the line to the proper output channel if this
     /// line represents an error which crosses multiple lines
     /// then that state is returned
-    fn pipe_line(line: &str, stderr: bool, errored: &mut bool) {
+    fn pipe_line(line: &str, errored: &mut bool) {
         if let Some((level, text)) = split_line(line) {
             match level {
                 "WARN" => warn!("{text}"),
                 "FATAL" | "ERROR" => error!("{text}"),
-                _ => {
-                    if stderr {
-                        error!("{text}");
-                    } else {
-                        info!("{text}");
-                    }
-                }
+                _ => info!("{text}"),
             }
             return;
         }
@@ -137,7 +160,7 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
         if line.starts_with("Exception in thread") {
             error!("{line}");
             *errored = true;
-        } else if line.contains("Error") || stderr {
+        } else if line.contains("Error") {
             error!("{line}");
         } else {
             info!("{line}")
@@ -151,13 +174,13 @@ async fn pipe_and_wait(mut command: Command) -> CommandResult<ExitStatus> {
             result = stdout.next_line() => {
                 let result = result?;
                 if let Some(line) = result {
-                    pipe_line(&line, false, &mut errored);
+                    pipe_line(&line, &mut errored);
                 }
             }
             result = stderr.next_line() => {
                 let result = result?;
                 if let Some(line) = result {
-                    pipe_line(&line, true, &mut errored);
+                    pipe_line(&line, &mut errored);
                 }
             }
             result = child.wait() => {
@@ -180,7 +203,6 @@ fn split_command(value: &str) -> Option<(&str, Vec<&str>)> {
 /// Transforms the provided `args` formatting them replacing their
 /// values with those stored in the `args_in` slice
 fn transform_args<'a: 'b, 'b>(args: Vec<&'a str>, args_in: &'a [&str]) -> Vec<&'b str> {
-
     /// Parses a format value from the provided `value`
     /// returning the index stored inside it or None if
     /// it could not be parsed as a format
@@ -188,7 +210,7 @@ fn transform_args<'a: 'b, 'b>(args: Vec<&'a str>, args_in: &'a [&str]) -> Vec<&'
         let start = value.find('{')?;
         let end = value.find('}')?;
         if end <= start {
-            return  None;
+            return None;
         }
         let format = &value[start + 1..end];
         format.parse::<usize>().ok()
@@ -209,10 +231,10 @@ fn transform_args<'a: 'b, 'b>(args: Vec<&'a str>, args_in: &'a [&str]) -> Vec<&'
 
 #[cfg(test)]
 mod test {
-    use std::env::current_dir;
+    use crate::cmd::{run_command_format, CommandError, CommandResult};
     use env_logger::WriteStyle;
     use log::LevelFilter;
-    use crate::cmd::{CommandError, CommandResult, run_command_format};
+    use std::env::current_dir;
 
     fn init_logger() {
         env_logger::builder()
@@ -244,8 +266,8 @@ mod test {
         let args = ["target"];
         let error_code = 5;
 
-
-       let err = run_command_format(&working_dir, command, &args).await
+        let err = run_command_format(&working_dir, command, &args)
+            .await
             .unwrap_err();
 
         match err {
@@ -257,5 +279,4 @@ mod test {
 
         Ok(())
     }
-
 }
